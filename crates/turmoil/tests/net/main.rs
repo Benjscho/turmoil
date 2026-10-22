@@ -1,5 +1,6 @@
 //! Tests for `turmoil::net`.
 
+mod faults;
 mod tcp;
 mod udp;
 

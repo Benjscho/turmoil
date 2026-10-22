@@ -5,9 +5,9 @@ simulated network, and a simulated filesystem behind a single `Builder` — star
 here if you want a complete simulation harness. Reach for `turmoil-net` or
 `turmoil-fs` directly if you're assembling your own runtime.
 
-> **Status.** The network layer is being lifted out into
-> [`turmoil-net`](../turmoil-net) and the filesystem layer into [`turmoil-fs`](../turmoil-fs).
-> Expect the shape of this crate's API to change as the lift lands.
+The network runs on [`turmoil-net`](../turmoil-net) — a TCP/UDP stack per
+host — and the filesystem on [`turmoil-fs`](../turmoil-fs). turmoil owns the
+runtime, the topology (latency, partitions, holds), and crashes.
 
 ```toml
 [dev-dependencies]
