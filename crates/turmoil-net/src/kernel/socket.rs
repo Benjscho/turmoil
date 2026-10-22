@@ -469,14 +469,28 @@ pub struct SocketTable {
 
 impl SocketTable {
     pub fn new() -> Self {
+        Self::with_ports(DEFAULT_EPHEMERAL_PORTS)
+    }
+
+    pub fn with_ports(ephemeral: RangeInclusive<u16>) -> Self {
         Self {
             next_id: 1,
             sockets: IndexMap::new(),
             bindings: IndexMap::new(),
             multicast_members: IndexMap::new(),
             connections: IndexMap::new(),
-            ports: PortAllocator::new(DEFAULT_EPHEMERAL_PORTS),
+            ports: PortAllocator::new(ephemeral),
         }
+    }
+
+    /// Remove every socket. `next_id` keeps counting so stale fds
+    /// never alias sockets created afterwards.
+    pub fn clear(&mut self) {
+        self.sockets.clear();
+        self.bindings.clear();
+        self.multicast_members.clear();
+        self.connections.clear();
+        self.ports = PortAllocator::new(self.ports.range.clone());
     }
 
     pub fn insert(&mut self, socket: Socket) -> Fd {

@@ -9,7 +9,7 @@ use tokio::io::ReadBuf;
 
 use crate::kernel::{Addr, Fd, SocketOption, SocketOptionKind, Type};
 use crate::shim::tokio::net::ToSocketAddrs;
-use crate::sys;
+use crate::{sys, sys_if_installed};
 
 #[derive(Debug)]
 pub struct UdpSocket {
@@ -252,6 +252,6 @@ fn unwrap_try(p: Poll<io::Result<usize>>) -> io::Result<usize> {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        sys(|k| k.close(self.fd));
+        sys_if_installed(|k| k.close(self.fd));
     }
 }

@@ -27,6 +27,8 @@ The primitives are public. The `fixture` module ships `lo` for single-host tests
 
 The stack is clock-free: packet routing is synchronous, and time plus the pending-delivery queue live in the harness. The built-in tokio fixtures ship a reference scheduler; a custom harness supplies its own.
 
+A harness that steps hosts itself can install the `Net` only while host code runs (`Net::enter`, then `EnterGuard::exit` to park it), drain one host at a time (`Net::egress`), apply per-link faults to each copy of a packet (`Net::receivers` + `Net::deliver_to`), crash a host without emitting FIN or RST (`Net::reset_host`), and supply its own name lookup (`Net::set_resolver`). This is how `turmoil` drives the stack.
+
 ## Using it
 
 The quick path, for a single-host test:

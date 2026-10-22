@@ -51,9 +51,13 @@ thread_local! {
     static CURRENT: RefCell<Option<Net>> = const { RefCell::new(None) };
 }
 
+type Resolver = Box<dyn Fn(&str) -> Option<std::net::IpAddr>>;
+
 pub struct Net {
     fabric: Fabric,
     dns: Dns,
+    /// Harness-supplied name lookup, consulted before `dns`.
+    resolver: Option<Resolver>,
     current: Option<HostId>,
     /// Installed rules, consulted in insertion order.
     rules: IndexMap<RuleId, Box<dyn Rule>>,
@@ -70,6 +74,7 @@ impl Net {
         Self {
             fabric: Fabric::new(cfg),
             dns: Dns::new(),
+            resolver: None,
             current: None,
             rules: IndexMap::new(),
             next_rule_id: 1,
@@ -107,6 +112,64 @@ impl Net {
         self.fabric.host_ids()
     }
 
+    /// The host owning `ip`. `None` for loopback and unclaimed IPs.
+    pub fn host_for_ip(&self, ip: std::net::IpAddr) -> Option<HostId> {
+        self.fabric.host_for_ip(ip)
+    }
+
+    /// Resolve hostnames through `resolver` before the built-in DNS.
+    /// For harnesses that own the name → IP mapping (and register
+    /// hosts by literal IP).
+    pub fn set_resolver(&mut self, resolver: impl Fn(&str) -> Option<std::net::IpAddr> + 'static) {
+        self.resolver = Some(Box::new(resolver));
+    }
+
+    /// Drain one host's outbound packets into `out`. For harnesses
+    /// that step hosts individually — [`EnterGuard::egress_all`] is
+    /// the all-hosts form.
+    pub fn egress(&mut self, host: HostId, out: &mut Vec<Packet>) {
+        self.fabric.egress(host, out);
+    }
+
+    /// Hosts that should receive `pkt`: the owner of a unicast
+    /// destination, or every other host on the shared link for UDP
+    /// broadcast/multicast. Empty for unknown destinations. Lets a
+    /// harness apply per-link faults to each copy of a cast.
+    pub fn receivers(&self, pkt: &Packet) -> Vec<HostId> {
+        self.fabric.receivers(pkt)
+    }
+
+    /// Hand `pkt` to `host`'s stack, bypassing routing. Pair with
+    /// [`Net::receivers`].
+    pub fn deliver_to(&mut self, host: HostId, pkt: Packet) {
+        self.fabric.deliver_to(host, pkt);
+    }
+
+    /// Walk the installed rules for `pkt`. First non-`Pass` verdict
+    /// wins; an empty rule chain returns `Verdict::Pass`.
+    pub fn evaluate(&mut self, pkt: &Packet) -> Verdict {
+        for rule in self.rules.values_mut() {
+            match rule.on_packet(pkt) {
+                Verdict::Pass => continue,
+                v => return v,
+            }
+        }
+        Verdict::Pass
+    }
+
+    /// Crash `host`'s stack: every socket and queued packet vanishes
+    /// without a FIN or RST. Peers find out when they next hear from
+    /// the host, or when their retransmits give up.
+    pub fn reset_host(&mut self, host: HostId) {
+        self.fabric.kernel_mut(host).reset();
+    }
+
+    /// Snapshot `host`'s socket table. The free [`netstat`] function
+    /// is the form for code running inside the installed `Net`.
+    pub fn netstat(&self, host: HostId) -> Netstat {
+        netstat::snapshot(self.fabric.kernel(host))
+    }
+
     /// Install a rule for the life of the `Net`. Use this when the
     /// rule is part of the test's fixed setup (symmetric latency,
     /// permanent packet filter, etc). For rules that only apply to
@@ -127,17 +190,11 @@ impl Net {
         self.rules.shift_remove(&id);
     }
 
-    /// Walk the installed rules in insertion order; first non-`Pass`
-    /// wins. Harness code calls this once per outbound packet to let
-    /// rules interpose.
-    fn evaluate(&mut self, pkt: &Packet) -> Verdict {
-        for rule in self.rules.values_mut() {
-            match rule.on_packet(pkt) {
-                Verdict::Pass => continue,
-                v => return v,
-            }
-        }
-        Verdict::Pass
+    fn lookup_name(&self, name: &str) -> Option<std::net::IpAddr> {
+        self.resolver
+            .as_ref()
+            .and_then(|resolve| resolve(name))
+            .or_else(|| self.dns.lookup(name))
     }
 
     /// Panics if another `Net` is already installed on this thread.
@@ -156,6 +213,7 @@ impl std::fmt::Debug for Net {
         f.debug_struct("Net")
             .field("fabric", &self.fabric)
             .field("dns", &self.dns)
+            .field("resolver", &self.resolver.is_some())
             .field("current", &self.current)
             .field("rules", &format!("{} installed", self.rules.len()))
             .finish()
@@ -174,6 +232,15 @@ pub struct EnterGuard {
 }
 
 impl EnterGuard {
+    /// Uninstall the `Net` and hand it back. Harnesses that interleave
+    /// several simulations on one thread install a `Net` only while
+    /// running its hosts, then park it until the next step.
+    pub fn exit(self) -> Net {
+        let net = CURRENT.with(|c| c.borrow_mut().take().expect("guard is live"));
+        std::mem::forget(self);
+        net
+    }
+
     /// Drain every host's outbound queue into `out`. The caller decides
     /// what happens next — typically: consult rules via
     /// [`EnterGuard::evaluate`] for each packet and then
@@ -237,6 +304,20 @@ impl Drop for EnterGuard {
     }
 }
 
+/// Like [`sys`], but a no-op when no `Net` or current host is
+/// installed. For `Drop` impls: sockets may outlive their simulation
+/// during teardown, and there is nothing left to close.
+pub(crate) fn sys_if_installed(f: impl FnOnce(&mut Kernel)) {
+    CURRENT.with(|c| {
+        let mut cell = c.borrow_mut();
+        let Some(net) = cell.as_mut() else { return };
+        let Some(id) = net.current else { return };
+        if let Some(kernel) = net.fabric.try_kernel_mut(id) {
+            f(kernel);
+        }
+    })
+}
+
 pub(crate) fn sys<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
     CURRENT.with(|c| {
         let mut cell = c.borrow_mut();
@@ -254,7 +335,7 @@ pub(crate) fn sys<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 /// if there is no `Net` installed, or if the name isn't registered
 /// and can't be parsed as an IP literal.
 pub fn lookup_host(name: &str) -> Option<std::net::IpAddr> {
-    CURRENT.with(|c| c.borrow().as_ref().and_then(|net| net.dns.lookup(name)))
+    CURRENT.with(|c| c.borrow().as_ref().and_then(|net| net.lookup_name(name)))
 }
 
 /// Pin which host subsequent [`sys`](crate) calls (i.e. socket

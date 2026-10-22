@@ -172,6 +172,7 @@ pub(super) fn peek_from(
 }
 
 pub(super) fn deliver(k: &mut Kernel, pkt: &Packet, d: &UdpDatagram, scope: InterfaceId) {
+    let cap = k.udp_recv_queue_cap;
     // Linux rejects loopback-source packets arriving on a non-loopback device
     // under the default route_localnet policy. Source binding is not routing.
     if (pkt.is_broadcast() || pkt.dst.is_multicast())
@@ -213,7 +214,7 @@ pub(super) fn deliver(k: &mut Kernel, pkt: &Packet, d: &UdpDatagram, scope: Inte
                     st.multicast_all_v6
                 };
                 if !multicast || all || st.multicast_memberships().contains(&membership) {
-                    enqueue(st, pkt, d, scope);
+                    enqueue(st, pkt, d, scope, cap);
                 }
             });
         }
@@ -232,6 +233,7 @@ pub(super) fn deliver(k: &mut Kernel, pkt: &Packet, d: &UdpDatagram, scope: Inte
                 pkt,
                 d,
                 scope,
+                cap,
             );
             return;
         }
@@ -289,6 +291,7 @@ pub(super) fn deliver(k: &mut Kernel, pkt: &Packet, d: &UdpDatagram, scope: Inte
         pkt,
         d,
         scope,
+        cap,
     );
 }
 
@@ -302,12 +305,16 @@ fn source_endpoint(ip: IpAddr, port: u16, interface: InterfaceId) -> Addr {
     Addr::Inet(addr)
 }
 
-fn enqueue(st: &mut Socket, pkt: &Packet, d: &UdpDatagram, interface: InterfaceId) {
+fn enqueue(st: &mut Socket, pkt: &Packet, d: &UdpDatagram, interface: InterfaceId, cap: usize) {
     let from = source_endpoint(pkt.src, d.src_port, interface);
     if let Some(peer) = &st.peer {
         if peer != &from {
             return;
         }
+    }
+    // A full receive queue drops the datagram, like a full SO_RCVBUF.
+    if st.recv_queue.len() >= cap {
+        return;
     }
     st.recv_queue.push_back((from, d.payload.clone()));
     st.wake_read();

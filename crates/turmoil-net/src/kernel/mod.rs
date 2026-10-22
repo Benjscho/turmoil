@@ -12,11 +12,14 @@
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::task::{Context, Poll};
 
 use tokio::io::ReadBuf;
 
-use crate::kernel::socket::{BindKey, SocketTable, DEFAULT_RECV_BUF_CAP, DEFAULT_SEND_BUF_CAP};
+use crate::kernel::socket::{
+    BindKey, SocketTable, DEFAULT_EPHEMERAL_PORTS, DEFAULT_RECV_BUF_CAP, DEFAULT_SEND_BUF_CAP,
+};
 
 mod interface;
 mod packet;
@@ -72,6 +75,11 @@ pub struct KernelConfig {
     pub default_backlog: usize,
     pub retx_threshold: u32,
     pub retx_max: u32,
+    /// Ports handed out for `:0` binds and implicit binds on
+    /// `connect`/`sendto`. Linux `ip_local_port_range`.
+    pub ephemeral_ports: RangeInclusive<u16>,
+    /// Datagrams queued per UDP socket before new arrivals are dropped.
+    pub udp_recv_queue_cap: usize,
 }
 
 impl Default for KernelConfig {
@@ -84,6 +92,8 @@ impl Default for KernelConfig {
             default_backlog: DEFAULT_BACKLOG,
             retx_threshold: DEFAULT_RETX_THRESHOLD,
             retx_max: DEFAULT_RETX_MAX,
+            ephemeral_ports: DEFAULT_EPHEMERAL_PORTS,
+            udp_recv_queue_cap: usize::MAX,
         }
     }
 }
@@ -115,6 +125,14 @@ impl KernelConfig {
     }
     pub fn retx_max(mut self, v: u32) -> Self {
         self.retx_max = v;
+        self
+    }
+    pub fn ephemeral_ports(mut self, v: RangeInclusive<u16>) -> Self {
+        self.ephemeral_ports = v;
+        self
+    }
+    pub fn udp_recv_queue_cap(mut self, v: usize) -> Self {
+        self.udp_recv_queue_cap = v;
         self
     }
 }
@@ -156,6 +174,7 @@ pub struct Kernel {
     pub(crate) default_backlog: usize,
     pub(crate) retx_threshold: u32,
     pub(crate) retx_max: u32,
+    pub(crate) udp_recv_queue_cap: usize,
     /// Packets queued by `poll_send_*` awaiting `egress()`.
     outbound: VecDeque<Outbound>,
     /// Monotonic TCP initial-sequence-number source. Deterministic by
@@ -172,16 +191,27 @@ impl Kernel {
 
     pub fn with_config(cfg: KernelConfig) -> Self {
         Self {
-            sockets: SocketTable::new(),
+            sockets: SocketTable::with_ports(cfg.ephemeral_ports),
             interfaces: Interfaces::new(cfg.mtu, cfg.loopback_mtu),
             send_buf_cap: cfg.send_buf_cap,
             recv_buf_cap: cfg.recv_buf_cap,
             default_backlog: cfg.default_backlog,
             retx_threshold: cfg.retx_threshold,
             retx_max: cfg.retx_max,
+            udp_recv_queue_cap: cfg.udp_recv_queue_cap,
             outbound: VecDeque::new(),
             tcp_isn: 0x0100_0000,
         }
+    }
+
+    /// Power-cycle the stack: discard every socket and queued packet
+    /// without emitting FIN or RST, as when a host crashes. Interfaces
+    /// and configuration survive. Fds are never reused, so handles
+    /// from before the reset fail with `NotFound` instead of aliasing
+    /// new sockets.
+    pub fn reset(&mut self) {
+        self.sockets.clear();
+        self.outbound.clear();
     }
 
     /// Create a new socket in this kernel's socket table.
